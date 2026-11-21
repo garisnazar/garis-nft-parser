@@ -11,29 +11,17 @@ const WALLET =
   "UQChRfzub4CLp2FAV998bfowFC4eE3aqIRQQeZinoajQ0oOG";
 
 const PLANS = {
-  day: {
-    name: "1 день",
-    seconds: 86400,
-    amount: 1
-  },
-  week: {
-    name: "7 дней",
-    seconds: 604800,
-    amount: 3
-  },
-  forever: {
-    name: "Навсегда",
-    seconds: null,
-    amount: 15
-  }
+  day: { name: "1 день", seconds: 86400, amount: 1 },
+  week: { name: "7 дней", seconds: 604800, amount: 3 },
+  forever: { name: "Навсегда", seconds: null, amount: 15 }
 };
 
 const TRIAL_SECONDS = 1800;
 const ORDER_LIFETIME = 1800;
+const RESERVE_COOLDOWN = 30;
 
-// ==========================================
-// WORKER
-// ==========================================
+// Парсер обращается к каталогу не чаще одного раза в 5 минут.
+// Cron в Cloudflare может оставаться * * * * *.
 
 export default {
   async fetch(request, env) {
@@ -44,52 +32,58 @@ export default {
         ok: true,
         project: "Garis NFT Parser",
         payment: "TON",
+        parser: env.NFTPARS_API_KEY ? "configured" : "not_configured",
         status: "working"
       });
     }
 
-    if (url.pathname !== "/webhook") {
-      return new Response("Garis NFT Parser is running");
-    }
-
-    if (request.method !== "POST") {
-      return new Response("Method not allowed", { status: 405 });
-    }
-
-    if (
-      !env.WEBHOOK_SECRET ||
-      request.headers.get("X-Telegram-Bot-Api-Secret-Token") !==
-        env.WEBHOOK_SECRET
-    ) {
-      return new Response("Unauthorized", { status: 401 });
-    }
-
-    let update;
-
-    try {
-      update = await request.json();
-    } catch {
-      return new Response("Invalid JSON", { status: 400 });
-    }
-
-    try {
-      if (update.message) {
-        await handleMessage(update.message, env);
+    if (url.pathname === "/webhook") {
+      if (request.method !== "POST") {
+        return new Response("Method not allowed", { status: 405 });
       }
 
-      if (update.callback_query) {
-        await handleCallback(update.callback_query, env);
+      if (
+        !env.WEBHOOK_SECRET ||
+        request.headers.get("X-Telegram-Bot-Api-Secret-Token") !==
+          env.WEBHOOK_SECRET
+      ) {
+        return new Response("Unauthorized", { status: 401 });
       }
-    } catch (error) {
-      console.error("BOT ERROR:", error);
+
+      let update;
+
+      try {
+        update = await request.json();
+      } catch {
+        return new Response("Invalid JSON", { status: 400 });
+      }
+
+      try {
+        if (update.message) {
+          await handleMessage(update.message, env);
+        }
+
+        if (update.callback_query) {
+          await handleCallback(update.callback_query, env);
+        }
+      } catch (error) {
+        console.error("BOT ERROR:", error);
+      }
+
+      return new Response("OK");
     }
 
-    return new Response("OK");
+    return new Response("Garis NFT Parser is running");
   },
 
   async scheduled(controller, env, ctx) {
-    ctx.waitUntil(checkTonPayments(env));
-    ctx.waitUntil(expireSubscriptions(env));
+    ctx.waitUntil(
+      Promise.allSettled([
+        checkTonPayments(env),
+        expireSubscriptions(env),
+        runNftParser(env)
+      ])
+    );
   }
 };
 
@@ -106,9 +100,7 @@ async function telegram(method, env, body = {}) {
     `https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`,
     {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
     }
   );
@@ -132,9 +124,7 @@ async function sendMessage(chatId, text, env, keyboard = null) {
     disable_web_page_preview: true
   };
 
-  if (keyboard) {
-    body.reply_markup = keyboard;
-  }
+  if (keyboard) body.reply_markup = keyboard;
 
   return telegram("sendMessage", env, body);
 }
@@ -148,7 +138,7 @@ async function answerCallback(queryId, env, text = "", alert = false) {
 }
 
 // ==========================================
-// DATABASE HELPERS
+// GENERAL HELPERS
 // ==========================================
 
 function now() {
@@ -165,13 +155,34 @@ function escapeHtml(value) {
   })[char]);
 }
 
+function getGroupId(env) {
+  return env.PRIVATE_GROUP_ID || GROUP_ID;
+}
+
+// ==========================================
+// DATABASE
+// ==========================================
+
+async function ensureParserTables(env) {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS user_cooldowns (
+      telegram_id INTEGER PRIMARY KEY,
+      last_reserved_at INTEGER NOT NULL DEFAULT 0
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS parser_state (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    )
+  `).run();
+}
+
 async function saveUser(user, env) {
   await env.DB.prepare(`
     INSERT INTO users (
-      telegram_id,
-      username,
-      first_name,
-      created_at
+      telegram_id, username, first_name, created_at
     )
     VALUES (?, ?, ?, ?)
     ON CONFLICT(telegram_id) DO UPDATE SET
@@ -192,10 +203,7 @@ async function getActiveSubscription(userId, env) {
     WHERE telegram_id = ?
       AND status = 'active'
       AND starts_at <= ?
-      AND (
-        expires_at IS NULL
-        OR expires_at > ?
-      )
+      AND (expires_at IS NULL OR expires_at > ?)
     ORDER BY
       CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END DESC,
       expires_at DESC
@@ -242,6 +250,11 @@ async function handleMessage(message, env) {
     return;
   }
 
+  if (command === "/nftstatus") {
+    await showNftStatus(chatId, env);
+    return;
+  }
+
   if (command === "/paysupport") {
     const support = env.SUPPORT_USERNAME
       ? "@" + env.SUPPORT_USERNAME
@@ -262,8 +275,62 @@ async function handleMessage(message, env) {
       "📚 <b>Команды</b>\n\n" +
       "/start — главное меню\n" +
       "/myaccess — моя подписка\n" +
+      "/nftstatus — состояние NFT-парсера\n" +
       "/paysupport — поддержка\n" +
       "/help — помощь",
+      env
+    );
+  }
+}
+
+// ==========================================
+// NFTPARS STATUS
+// ==========================================
+
+async function showNftStatus(chatId, env) {
+  if (!env.NFTPARS_API_KEY) {
+    await sendMessage(
+      chatId,
+      "❌ NFTPARS_API_KEY не найден в настройках Worker.",
+      env
+    );
+    return;
+  }
+
+  try {
+    const response = await fetch(
+      "https://nftpars.app/api/v1/stats/indexing",
+      {
+        headers: {
+          Authorization: "Bearer " + env.NFTPARS_API_KEY,
+          Accept: "application/json"
+        }
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok || data.ok === false) {
+      throw new Error(
+        data.error?.code || "HTTP " + response.status
+      );
+    }
+
+    await sendMessage(
+      chatId,
+      "💎 <b>NFTPARS подключён</b>\n\n" +
+      "Статус API: <b>доступен</b>\n" +
+      "Запрос статистики выполнен успешно.\n\n" +
+      "Полная статистика индексации доступна в кабинете NFTPARS.",
+      env
+    );
+  } catch (error) {
+    console.error("NFTPARS STATUS ERROR:", error);
+
+    await sendMessage(
+      chatId,
+      "❌ Не удалось проверить NFTPARS.\n\n" +
+      "Ошибка: <code>" + escapeHtml(error.message) + "</code>",
       env
     );
   }
@@ -300,7 +367,6 @@ async function handleCallback(query, env) {
   const data = query.data || "";
   const userId = query.from.id;
 
-  // Бронирование подарка из групповой темы
   if (data.startsWith("reserve:")) {
     await reserveGift(query, env);
     return;
@@ -339,7 +405,12 @@ async function handleCallback(query, env) {
 // ==========================================
 
 async function activateTrial(userId, chatId, env) {
-  const current = now();
+  const active = await getActiveSubscription(userId, env);
+
+  if (active) {
+    await sendMessage(chatId, "У тебя уже есть активная подписка.", env);
+    return;
+  }
 
   const result = await env.DB.prepare(`
     UPDATE users
@@ -357,25 +428,14 @@ async function activateTrial(userId, chatId, env) {
     return;
   }
 
-  const active = await getActiveSubscription(userId, env);
-
-  if (active) {
-    await sendMessage(
-      chatId,
-      "У тебя уже есть активная подписка.",
-      env
-    );
-    return;
-  }
-
-  const expiresAt = current + TRIAL_SECONDS;
+  const expiresAt = now() + TRIAL_SECONDS;
 
   await env.DB.prepare(`
     INSERT INTO subscriptions (
       telegram_id, plan, starts_at, expires_at, status
     )
     VALUES (?, 'trial', ?, ?, 'active')
-  `).bind(userId, current, expiresAt).run();
+  `).bind(userId, now(), expiresAt).run();
 
   await sendJoinLink(userId, chatId, expiresAt, env);
 }
@@ -412,17 +472,11 @@ async function createTonOrder(userId, chatId, planName, env) {
     .toUpperCase();
 
   const amountNano = plan.amount * 1000000000;
-  const createdAt = now();
 
   await env.DB.prepare(`
     INSERT INTO ton_orders (
-      id,
-      telegram_id,
-      plan,
-      amount_nano,
-      payment_comment,
-      status,
-      created_at
+      id, telegram_id, plan, amount_nano,
+      payment_comment, status, created_at
     )
     VALUES (?, ?, ?, ?, ?, 'pending', ?)
   `).bind(
@@ -431,7 +485,7 @@ async function createTonOrder(userId, chatId, planName, env) {
     planName,
     amountNano,
     comment,
-    createdAt
+    now()
   ).run();
 
   const paymentUrl =
@@ -447,7 +501,6 @@ async function createTonOrder(userId, chatId, planName, env) {
     "Сумма: <b>" + plan.amount + " TON</b>\n\n" +
     "Кошелёк:\n<code>" + escapeHtml(env.TON_WALLET) + "</code>\n\n" +
     "Комментарий к переводу:\n<code>" + comment + "</code>\n\n" +
-    "Нажми кнопку, чтобы открыть кошелёк с заполненными данными.\n\n" +
     "⏳ Заказ действует 30 минут. После перевода бот проверит оплату автоматически.",
     env,
     {
@@ -473,7 +526,7 @@ async function getTonTransactions(env) {
   const response = await fetch(url.toString(), {
     headers: {
       "X-API-Key": env.TON_API_KEY,
-      "Accept": "application/json"
+      Accept: "application/json"
     }
   });
 
@@ -512,59 +565,55 @@ function getTransactionComment(tx) {
   return "";
 }
 
-// ==========================================
-// CHECK TON PAYMENTS
-// ==========================================
-
 async function checkTonPayments(env) {
-  if (!env.TON_API_KEY || !env.TON_WALLET) {
-    console.error("TON settings are missing");
-    return;
-  }
+  if (!env.TON_API_KEY || !env.TON_WALLET) return;
 
-  const transactions = await getTonTransactions(env);
-  const currentTime = now();
+  try {
+    const transactions = await getTonTransactions(env);
+    const currentTime = now();
 
-  for (const tx of transactions) {
-    const msg = tx.in_msg;
+    for (const tx of transactions) {
+      const msg = tx.in_msg;
 
-    if (!msg || !msg.value) continue;
+      if (!msg || !msg.value) continue;
 
-    const comment = getTransactionComment(tx);
-    if (!comment) continue;
+      const comment = getTransactionComment(tx);
+      if (!comment) continue;
 
-    const txHash = tx.hash || msg.hash;
-    if (!txHash) continue;
+      const txHash = tx.hash || msg.hash;
+      if (!txHash) continue;
 
-    const value = BigInt(msg.value);
-    const txTime = Number(tx.now || msg.created_at || 0);
+      const value = BigInt(msg.value);
+      const txTime = Number(tx.now || msg.created_at || 0);
 
-    const order = await env.DB.prepare(`
-      SELECT *
-      FROM ton_orders
-      WHERE payment_comment = ?
-        AND status = 'pending'
-        AND created_at <= ?
-    `).bind(comment, txTime || currentTime).first();
-
-    if (!order) continue;
-
-    if (currentTime - order.created_at > ORDER_LIFETIME) {
-      await env.DB.prepare(`
-        UPDATE ton_orders
-        SET status = 'expired'
-        WHERE id = ?
+      const order = await env.DB.prepare(`
+        SELECT *
+        FROM ton_orders
+        WHERE payment_comment = ?
           AND status = 'pending'
-      `).bind(order.id).run();
-      continue;
-    }
+          AND created_at <= ?
+      `).bind(comment, txTime || currentTime).first();
 
-    if (value !== BigInt(order.amount_nano)) {
-      console.error("Wrong TON amount for order:", order.id);
-      continue;
-    }
+      if (!order) continue;
 
-    await activatePaidOrder(order, txHash, env);
+      if (currentTime - order.created_at > ORDER_LIFETIME) {
+        await env.DB.prepare(`
+          UPDATE ton_orders
+          SET status = 'expired'
+          WHERE id = ? AND status = 'pending'
+        `).bind(order.id).run();
+        continue;
+      }
+
+      if (value !== BigInt(order.amount_nano)) {
+        console.error("Wrong TON amount for order:", order.id);
+        continue;
+      }
+
+      await activatePaidOrder(order, txHash, env);
+    }
+  } catch (error) {
+    console.error("TON PAYMENT CHECK ERROR:", error);
   }
 }
 
@@ -599,36 +648,35 @@ async function activatePaidOrder(order, txHash, env) {
     FROM subscriptions
     WHERE telegram_id = ?
       AND status = 'active'
-      AND (
-        expires_at IS NULL
-        OR expires_at > ?
-      )
+      AND (expires_at IS NULL OR expires_at > ?)
   `).bind(order.telegram_id, currentTime).first();
 
-  const startTime = Math.max(
-    currentTime,
-    Number(current?.expiry || currentTime)
-  );
+  let expiresAt = null;
 
-  const expiresAt = plan.seconds
-    ? startTime + plan.seconds
-    : null;
+  if (Number(current?.permanent || 0) > 0) {
+    expiresAt = null;
+  } else {
+    const startTime = Math.max(
+      currentTime,
+      Number(current?.expiry || currentTime)
+    );
 
-  await env.DB.prepare(`
-    INSERT INTO subscriptions (
-      telegram_id,
-      plan,
-      starts_at,
-      expires_at,
-      status
-    )
-    VALUES (?, ?, ?, ?, 'active')
-  `).bind(
-    order.telegram_id,
-    order.plan,
-    startTime,
-    expiresAt
-  ).run();
+    expiresAt = plan.seconds
+      ? startTime + plan.seconds
+      : null;
+
+    await env.DB.prepare(`
+      INSERT INTO subscriptions (
+        telegram_id, plan, starts_at, expires_at, status
+      )
+      VALUES (?, ?, ?, ?, 'active')
+    `).bind(
+      order.telegram_id,
+      order.plan,
+      startTime,
+      expiresAt
+    ).run();
+  }
 
   const expiryText = expiresAt
     ? new Date(expiresAt * 1000).toLocaleString("ru-RU")
@@ -656,17 +704,13 @@ async function activatePaidOrder(order, txHash, env) {
 // ==========================================
 
 async function sendJoinLink(userId, chatId, expiresAt, env) {
-  const groupId = env.PRIVATE_GROUP_ID || GROUP_ID;
-
   const inviteBody = {
-    chat_id: groupId,
+    chat_id: getGroupId(env),
     member_limit: 1,
     name: "Garis-" + userId + "-" + Date.now()
   };
 
-  if (expiresAt) {
-    inviteBody.expire_date = expiresAt;
-  }
+  if (expiresAt) inviteBody.expire_date = expiresAt;
 
   const invite = await telegram(
     "createChatInviteLink",
@@ -721,65 +765,302 @@ async function showAccess(chatId, env) {
 // ==========================================
 
 async function expireSubscriptions(env) {
-  const groupId = env.PRIVATE_GROUP_ID || GROUP_ID;
   const currentTime = now();
 
-  const expired = await env.DB.prepare(`
-    SELECT DISTINCT telegram_id
-    FROM subscriptions
-    WHERE status = 'active'
-      AND expires_at IS NOT NULL
-      AND expires_at <= ?
-  `).bind(currentTime).all();
-
-  for (const row of expired.results || []) {
-    const futureOrCurrent = await env.DB.prepare(`
-      SELECT id
+  try {
+    const expired = await env.DB.prepare(`
+      SELECT DISTINCT telegram_id
       FROM subscriptions
-      WHERE telegram_id = ?
-        AND status = 'active'
-        AND (
-          expires_at IS NULL
-          OR expires_at > ?
-          OR starts_at > ?
-        )
-      LIMIT 1
-    `).bind(
-      row.telegram_id,
-      currentTime,
-      currentTime
-    ).first();
-
-    await env.DB.prepare(`
-      UPDATE subscriptions
-      SET status = 'expired'
-      WHERE telegram_id = ?
-        AND status = 'active'
+      WHERE status = 'active'
         AND expires_at IS NOT NULL
         AND expires_at <= ?
-    `).bind(row.telegram_id, currentTime).run();
+    `).bind(currentTime).all();
 
-    if (futureOrCurrent) continue;
+    for (const row of expired.results || []) {
+      const futureOrCurrent = await env.DB.prepare(`
+        SELECT id
+        FROM subscriptions
+        WHERE telegram_id = ?
+          AND status = 'active'
+          AND (
+            expires_at IS NULL
+            OR expires_at > ?
+            OR starts_at > ?
+          )
+        LIMIT 1
+      `).bind(
+        row.telegram_id,
+        currentTime,
+        currentTime
+      ).first();
 
-    try {
-      await telegram("banChatMember", env, {
-        chat_id: groupId,
-        user_id: row.telegram_id
-      });
+      await env.DB.prepare(`
+        UPDATE subscriptions
+        SET status = 'expired'
+        WHERE telegram_id = ?
+          AND status = 'active'
+          AND expires_at IS NOT NULL
+          AND expires_at <= ?
+      `).bind(row.telegram_id, currentTime).run();
 
-      await telegram("unbanChatMember", env, {
-        chat_id: groupId,
-        user_id: row.telegram_id,
-        only_if_banned: true
-      });
-    } catch (error) {
-      console.error("Member removal error:", row.telegram_id, error);
+      if (futureOrCurrent) continue;
+
+      try {
+        await telegram("banChatMember", env, {
+          chat_id: getGroupId(env),
+          user_id: row.telegram_id
+        });
+
+        await telegram("unbanChatMember", env, {
+          chat_id: getGroupId(env),
+          user_id: row.telegram_id,
+          only_if_banned: true
+        });
+      } catch (error) {
+        console.error("Member removal error:", row.telegram_id, error);
+      }
     }
+  } catch (error) {
+    console.error("EXPIRE SUBSCRIPTIONS ERROR:", error);
   }
 }
 
 // ==========================================
-// RESERVE NFT
+// NFTPARS API
+// ==========================================
+
+async function nftparsRequest(path, env) {
+  if (!env.NFTPARS_API_KEY) {
+    throw new Error("NFTPARS_API_KEY is missing");
+  }
+
+  const response = await fetch(
+    "https://nftpars.app/api/v1" + path,
+    {
+      headers: {
+        Authorization: "Bearer " + env.NFTPARS_API_KEY,
+        Accept: "application/json"
+      }
+    }
+  );
+
+  let body;
+
+  try {
+    body = await response.json();
+  } catch {
+    throw new Error("NFTPARS returned invalid JSON");
+  }
+
+  if (!response.ok || body.ok === false) {
+    throw new Error(
+      body.error?.code ||
+      body.error?.message ||
+      "NFTPARS HTTP " + response.status
+    );
+  }
+
+  return body;
+}
+
+// ==========================================
+// NFT PARSER
+// ==========================================
+
+async function runNftParser(env) {
+  if (!env.NFTPARS_API_KEY) return;
+
+  try {
+    await ensureParserTables(env);
+
+    const lastScan = await env.DB.prepare(`
+      SELECT value
+      FROM parser_state
+      WHERE key = 'last_scan'
+    `).first();
+
+    const lastScanTime = Number(lastScan?.value || 0);
+
+    // Защита от слишком частых и дорогих запросов.
+    if (now() - lastScanTime < 300) return;
+
+    await env.DB.prepare(`
+      INSERT INTO parser_state (key, value)
+      VALUES ('last_scan', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).bind(String(now())).run();
+
+    const cursorRow = await env.DB.prepare(`
+      SELECT value
+      FROM parser_state
+      WHERE key = 'search_cursor'
+    `).first();
+
+    const cursor = cursorRow?.value || null;
+
+    const params = new URLSearchParams();
+    params.set("owner_status", "VERIFIED");
+    params.set("limit", "50");
+
+    if (cursor) params.set("cursor", cursor);
+
+    const result = await nftparsRequest(
+      "/search?" + params.toString(),
+      env
+    );
+
+    const data = result.data || {};
+    const items = Array.isArray(data.items)
+      ? data.items
+      : Array.isArray(data.gifts)
+        ? data.gifts
+        : Array.isArray(data.results)
+          ? data.results
+          : [];
+
+    let published = 0;
+
+    for (const gift of items) {
+      const owner = gift.owner || {};
+      const telegramOwner = owner.telegram || {};
+
+      // Публикуем только подтверждённых текущих владельцев.
+      if (owner.status !== "VERIFIED") continue;
+      if (!telegramOwner.id) continue;
+
+      const slug = gift.slug || gift.id;
+      if (!slug) continue;
+
+      const collection =
+        gift.collection?.name ||
+        gift.collection?.slug ||
+        "Telegram Gift";
+
+      const giftName =
+        gift.title ||
+        gift.name ||
+        slug;
+
+      const username = telegramOwner.username || null;
+      const ownerId = Number(telegramOwner.id);
+
+      const insert = await env.DB.prepare(`
+        INSERT OR IGNORE INTO nft_items (
+          id,
+          collection,
+          gift_name,
+          owner_username,
+          owner_id,
+          premium,
+          gifts_count,
+          category,
+          source,
+          discovered_at,
+          status
+        )
+        VALUES (?, ?, ?, ?, ?, NULL, NULL, 'new', 'NFTPARS', ?, 'available')
+      `).bind(
+        String(slug),
+        String(collection),
+        String(giftName),
+        username,
+        ownerId,
+        now()
+      ).run();
+
+      // Если подарок уже есть в базе, повторно не публикуем.
+      if (insert.meta.changes !== 1) continue;
+
+      await publishNft(gift, owner, env);
+      published++;
+    }
+
+    const nextCursor = data.next_cursor || null;
+
+    await env.DB.prepare(`
+      INSERT INTO parser_state (key, value)
+      VALUES ('search_cursor', ?)
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    `).bind(nextCursor || "").run();
+
+    console.log(
+      "NFTPARS scan completed:",
+      "received =", items.length,
+      "published =", published,
+      "next cursor =", Boolean(nextCursor)
+    );
+
+  } catch (error) {
+    console.error("NFTPARS PARSER ERROR:", error);
+  }
+}
+
+// ==========================================
+// PUBLISH NFT
+// ==========================================
+
+async function publishNft(gift, owner, env) {
+  const telegramOwner = owner.telegram || {};
+
+  const slug = gift.slug || gift.id;
+  const collection =
+    gift.collection?.name ||
+    gift.collection?.slug ||
+    "Telegram Gift";
+
+  const title =
+    gift.title ||
+    gift.name ||
+    slug;
+
+  const username = telegramOwner.username
+    ? "@" + telegramOwner.username
+    : "Не указан";
+
+  const profile = telegramOwner.username
+    ? "https://t.me/" + encodeURIComponent(telegramOwner.username)
+    : null;
+
+  const giftUrl = gift.telegram_url ||
+    (slug ? "https://t.me/nft/" + encodeURIComponent(slug) : null);
+
+  let text =
+    "💎 <b>НОВАЯ NFT-НАХОДКА</b>\n\n" +
+    "🎁 Подарок: <b>" + escapeHtml(title) + "</b>\n" +
+    "📦 Коллекция: " + escapeHtml(collection) + "\n" +
+    "👤 Владелец: " + escapeHtml(username) + "\n" +
+    "🟢 Статус владельца: подтверждён\n" +
+    "🔎 Источник: NFTPARS";
+
+  if (profile) {
+    text += "\n\n👤 <a href=\"" + escapeHtml(profile) + "\">Открыть профиль</a>";
+  }
+
+  if (giftUrl) {
+    text += "\n🎁 <a href=\"" + escapeHtml(giftUrl) + "\">Открыть подарок</a>";
+  }
+
+  const keyboard = {
+    inline_keyboard: [
+      [{
+        text: "🔒 Занять",
+        callback_data: "reserve:" + String(slug)
+      }]
+    ]
+  };
+
+  await telegram("sendMessage", env, {
+    chat_id: getGroupId(env),
+    message_thread_id: TOPICS.new,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: true,
+    reply_markup: keyboard
+  });
+}
+
+// ==========================================
+// RESERVE NFT — 30 SECOND COOLDOWN
 // ==========================================
 
 async function reserveGift(query, env) {
@@ -804,6 +1085,8 @@ async function reserveGift(query, env) {
     return;
   }
 
+  await ensureParserTables(env);
+
   const gift = await env.DB.prepare(`
     SELECT *
     FROM nft_items
@@ -821,27 +1104,94 @@ async function reserveGift(query, env) {
     return;
   }
 
-  const update = await env.DB.prepare(`
+  const currentTime = now();
+
+  // Создаём запись, если пользователь бронирует впервые.
+  await env.DB.prepare(`
+    INSERT OR IGNORE INTO user_cooldowns (
+      telegram_id, last_reserved_at
+    )
+    VALUES (?, 0)
+  `).bind(userId).run();
+
+  const cooldown = await env.DB.prepare(`
+    SELECT last_reserved_at
+    FROM user_cooldowns
+    WHERE telegram_id = ?
+  `).bind(userId).first();
+
+  const previousTime = Number(cooldown?.last_reserved_at || 0);
+  const remaining = RESERVE_COOLDOWN - (currentTime - previousTime);
+
+  if (remaining > 0) {
+    await answerCallback(
+      query.id,
+      env,
+      "⏳ Следующий подарок можно занять через " + remaining + " сек.",
+      true
+    );
+    return;
+  }
+
+  // Атомарно захватываем 30-секундный интервал.
+  const cooldownUpdate = await env.DB.prepare(`
+    UPDATE user_cooldowns
+    SET last_reserved_at = ?
+    WHERE telegram_id = ?
+      AND last_reserved_at = ?
+  `).bind(
+    currentTime,
+    userId,
+    previousTime
+  ).run();
+
+  if (cooldownUpdate.meta.changes !== 1) {
+    await answerCallback(
+      query.id,
+      env,
+      "⏳ Подожди немного и попробуй снова.",
+      true
+    );
+    return;
+  }
+
+  // Атомарно занимаем подарок.
+  const giftUpdate = await env.DB.prepare(`
     UPDATE nft_items
     SET status = 'reserved'
     WHERE id = ?
       AND status = 'available'
   `).bind(giftId).run();
 
-  if (update.meta.changes !== 1) {
-    await answerCallback(query.id, env, "Подарок уже заняли.", true);
+  if (giftUpdate.meta.changes !== 1) {
+    // Подарок уже забрали — возвращаем cooldown.
+    await env.DB.prepare(`
+      UPDATE user_cooldowns
+      SET last_reserved_at = ?
+      WHERE telegram_id = ?
+        AND last_reserved_at = ?
+    `).bind(
+      previousTime,
+      userId,
+      currentTime
+    ).run();
+
+    await answerCallback(
+      query.id,
+      env,
+      "Этот подарок уже заняли.",
+      true
+    );
     return;
   }
 
   try {
     await env.DB.prepare(`
       INSERT INTO reservations (
-        nft_id,
-        telegram_id,
-        reserved_at
+        nft_id, telegram_id, reserved_at
       )
       VALUES (?, ?, ?)
-    `).bind(giftId, userId, now()).run();
+    `).bind(giftId, userId, currentTime).run();
   } catch (error) {
     await env.DB.prepare(`
       UPDATE nft_items
@@ -850,10 +1200,25 @@ async function reserveGift(query, env) {
         AND status = 'reserved'
     `).bind(giftId).run();
 
+    await env.DB.prepare(`
+      UPDATE user_cooldowns
+      SET last_reserved_at = ?
+      WHERE telegram_id = ?
+        AND last_reserved_at = ?
+    `).bind(
+      previousTime,
+      userId,
+      currentTime
+    ).run();
+
     throw error;
   }
 
-  await answerCallback(query.id, env, "Подарок закреплён за тобой!");
+  await answerCallback(
+    query.id,
+    env,
+    "✅ Подарок закреплён за тобой!"
+  );
 
   const originalText = message.text || message.caption || "NFT-подарок";
 
@@ -862,7 +1227,8 @@ async function reserveGift(query, env) {
       chat_id: message.chat.id,
       message_id: message.message_id,
       text: originalText + "\n\n🔒 <b>ПОДАРОК ЗАНЯТ</b>",
-      parse_mode: "HTML"
+      parse_mode: "HTML",
+      disable_web_page_preview: true
     });
   } catch (error) {
     console.error("Message edit error:", error);
@@ -870,14 +1236,15 @@ async function reserveGift(query, env) {
 
   const owner = gift.owner_username
     ? "@" + gift.owner_username
-    : "Владелец не указал публичный username.";
+    : "Публичный username не указан.";
 
   try {
     await sendMessage(
       userId,
       "✅ <b>Подарок закреплён за тобой!</b>\n\n" +
       "Подарок: " + escapeHtml(gift.gift_name) + "\n" +
-      "Владелец: " + escapeHtml(owner),
+      "Владелец: " + escapeHtml(owner) + "\n\n" +
+      "⏳ Следующий подарок можно занять через 30 секунд.",
       env
     );
   } catch (error) {
