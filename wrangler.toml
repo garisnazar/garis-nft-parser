@@ -4,7 +4,7 @@ main = "src/index.js"
 compatibility_date = "2026-11-21"
 
 [vars]
-BOT_USERNAME = "YOUR_BOT_USERNAME"
+BOT_USERNAME = "GarisParserBot"
 
 [[d1_databases]]
 binding = "DB"
