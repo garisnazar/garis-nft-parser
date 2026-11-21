@@ -144,6 +144,34 @@ async function handleMessage(message, env) {
   const chatId = message.chat.id;
   const text = message.text || "";
 
+  // ========================================
+  // КОМАНДА ПОЛУЧЕНИЯ ID ГРУППЫ И ТЕМЫ
+  // ========================================
+
+  const command = text.split(" ")[0].split("@")[0];
+
+  if (
+    command === "/ids" &&
+    (message.chat.type === "group" ||
+      message.chat.type === "supergroup")
+  ) {
+    await telegram("sendMessage", env, {
+      chat_id: chatId,
+      message_thread_id: message.message_thread_id,
+      text:
+        "💎 GARIS NFT PARSER\n\n" +
+        "📌 ID группы: " + chatId + "\n" +
+        "📌 ID темы: " +
+        (message.message_thread_id || "Главная тема") +
+        "\n\n" +
+        "Сохрани эти значения."
+    });
+
+    return;
+  }
+
+  // Остальные команды обрабатываем только в личке
+
   if (!user || chatId !== user.id) {
     return;
   }
@@ -273,7 +301,6 @@ async function showMenu(chatId, env) {
 async function handleCallback(query, env) {
   const data = query.data || "";
   const userId = query.from.id;
-
   const chatId = query.message?.chat?.id;
 
   await answerCallback(query.id, env);
@@ -397,17 +424,12 @@ async function createOrder(userId, chatId, planName, env) {
 
   await telegram("sendInvoice", env, {
     chat_id: chatId,
-
     title: "Garis NFT Parser — " + plan.name,
-
     description:
       "Доступ к приватной группе Garis NFT Parser. Тариф: " +
       plan.name,
-
     payload: orderId,
-
     currency: "XTR",
-
     prices: [
       {
         label: plan.name,
@@ -438,9 +460,7 @@ async function handlePreCheckout(query, env) {
 
   await telegram("answerPreCheckoutQuery", env, {
     pre_checkout_query_id: query.id,
-
     ok: Boolean(order),
-
     ...(!order
       ? {
           error_message:
@@ -456,7 +476,6 @@ async function handlePreCheckout(query, env) {
 
 async function handleSuccessfulPayment(message, env) {
   const payment = message.successful_payment;
-
   const userId = message.from.id;
   const chatId = message.chat.id;
   const orderId = payment.invoice_payload;
@@ -494,8 +513,6 @@ async function handleSuccessfulPayment(message, env) {
     return;
   }
 
-  // Защита от повторной обработки одного платежа
-
   const updated = await env.DB.prepare(`
     UPDATE orders
     SET status = 'paid',
@@ -525,9 +542,6 @@ async function handleSuccessfulPayment(message, env) {
     userId,
     currentTime
   ).first();
-
-  // Если у пользователя уже вечный доступ,
-  // дополнительный срок ему не требуется.
 
   if (!current?.permanent || Number(current.permanent) === 0) {
     const startTime = Math.max(
@@ -593,9 +607,7 @@ async function sendJoinLink(userId, chatId, expiresAt, env) {
 
   const inviteBody = {
     chat_id: env.PRIVATE_GROUP_ID,
-
     member_limit: 1,
-
     name: `Garis-${userId}-${Date.now()}`
   };
 
