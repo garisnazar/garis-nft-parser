@@ -1,0 +1,16 @@
+
+name = "garis-nft-parser"
+main = "src/index.js"
+compatibility_date = "2026-11-21"
+
+[vars]
+BOT_USERNAME = "YOUR_BOT_USERNAME"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "garis-nft-db"
+database_id = "YOUR_DATABASE_ID"
+migrations_dir = "migrations"
+
+[triggers]
+crons = ["*/5 * * * *"]
