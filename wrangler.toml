@@ -9,7 +9,7 @@ BOT_USERNAME = "GarisParserBot"
 [[d1_databases]]
 binding = "DB"
 database_name = "garis-nft-db"
-database_id = "YOUR_DATABASE_ID"
+database_id = "9d9ce912-d7ff-433e-9846-84c77fdec0b9"
 migrations_dir = "migrations"
 
 [triggers]
