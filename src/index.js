@@ -20,9 +20,6 @@ const TRIAL_SECONDS = 1800;
 const ORDER_LIFETIME = 1800;
 const RESERVE_COOLDOWN = 30;
 
-// Парсер обращается к каталогу не чаще одного раза в 5 минут.
-// Cron в Cloudflare может оставаться * * * * *.
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -255,6 +252,11 @@ async function handleMessage(message, env) {
     return;
   }
 
+  if (command === "/nfttest") {
+    await showNftTest(chatId, env);
+    return;
+  }
+
   if (command === "/paysupport") {
     const support = env.SUPPORT_USERNAME
       ? "@" + env.SUPPORT_USERNAME
@@ -276,6 +278,7 @@ async function handleMessage(message, env) {
       "/start — главное меню\n" +
       "/myaccess — моя подписка\n" +
       "/nftstatus — состояние NFT-парсера\n" +
+      "/nfttest — тест поиска NFTPARS\n" +
       "/paysupport — поддержка\n" +
       "/help — помощь",
       env
@@ -331,6 +334,125 @@ async function showNftStatus(chatId, env) {
       chatId,
       "❌ Не удалось проверить NFTPARS.\n\n" +
       "Ошибка: <code>" + escapeHtml(error.message) + "</code>",
+      env
+    );
+  }
+}
+
+// ==========================================
+// NFTPARS SEARCH TEST
+// ==========================================
+
+async function showNftTest(chatId, env) {
+  await sendMessage(
+    chatId,
+    "🔎 <b>Проверяю поиск NFTPARS...</b>\n\n" +
+    "Выполняю тестовый запрос. Публикации не будет.",
+    env
+  );
+
+  try {
+    const params = new URLSearchParams();
+
+    params.set("owner_status", "VERIFIED");
+    params.set("limit", "5");
+
+    const result = await nftparsRequest(
+      "/search?" + params.toString(),
+      env
+    );
+
+    const data = result.data || {};
+
+    let items = [];
+
+    if (Array.isArray(data)) {
+      items = data;
+    } else if (Array.isArray(data.items)) {
+      items = data.items;
+    } else if (Array.isArray(data.results)) {
+      items = data.results;
+    } else if (Array.isArray(data.gifts)) {
+      items = data.gifts;
+    }
+
+    const first = items[0] || {};
+    const gift = first.gift || first;
+    const owner = gift.owner || {};
+
+    const dataKeys = Object.keys(data);
+    const itemKeys = Object.keys(first);
+    const giftKeys = Object.keys(gift);
+
+    const ownerStatus = owner.status || "не найден";
+
+    const title =
+      gift.title ||
+      gift.name ||
+      gift.slug ||
+      "Название не найдено";
+
+    const collection =
+      gift.collection?.name ||
+      gift.collection?.slug ||
+      "Не указана";
+
+    const cursor =
+      data.next_cursor ||
+      data.nextCursor ||
+      null;
+
+    let report =
+      "💎 <b>РЕЗУЛЬТАТ ТЕСТА NFTPARS</b>\n\n" +
+      "🟢 API: запрос успешен\n" +
+      "📦 Получено записей: <b>" + items.length + "</b>\n" +
+      "👤 Статус первого владельца: <b>" +
+      escapeHtml(ownerStatus) + "</b>\n\n" +
+      "📋 <b>Структура ответа</b>\n" +
+      "Поля data: <code>" +
+      escapeHtml(dataKeys.join(", ") || "нет") +
+      "</code>\n\n" +
+      "Поля первой записи: <code>" +
+      escapeHtml(itemKeys.join(", ") || "нет") +
+      "</code>\n\n" +
+      "Поля подарка: <code>" +
+      escapeHtml(giftKeys.join(", ") || "нет") +
+      "</code>\n\n";
+
+    if (items.length > 0) {
+      report +=
+        "🎁 <b>Первая находка</b>\n" +
+        "Название: " + escapeHtml(title) + "\n" +
+        "Коллекция: " + escapeHtml(collection) + "\n" +
+        "Владелец: " + escapeHtml(ownerStatus) + "\n\n";
+    } else {
+      report +=
+        "⚠️ По этому запросу записей не найдено.\n\n";
+    }
+
+    report +=
+      "🔄 Следующая страница: " +
+      (cursor ? "есть" : "нет") + "\n\n" +
+      "Тест завершён. Публикации не выполнялись.";
+
+    await sendMessage(chatId, report, env);
+
+    console.log("NFTPARS TEST:", {
+      dataKeys,
+      itemCount: items.length,
+      itemKeys,
+      giftKeys,
+      ownerStatus,
+      hasCursor: Boolean(cursor)
+    });
+
+  } catch (error) {
+    console.error("NFTPARS SEARCH TEST ERROR:", error);
+
+    await sendMessage(
+      chatId,
+      "❌ <b>Ошибка теста поиска</b>\n\n" +
+      "<code>" + escapeHtml(error.message) + "</code>",
       env
     );
   }
@@ -881,7 +1003,6 @@ async function runNftParser(env) {
 
     const lastScanTime = Number(lastScan?.value || 0);
 
-    // Защита от слишком частых и дорогих запросов.
     if (now() - lastScanTime < 300) return;
 
     await env.DB.prepare(`
@@ -924,7 +1045,6 @@ async function runNftParser(env) {
       const owner = gift.owner || {};
       const telegramOwner = owner.telegram || {};
 
-      // Публикуем только подтверждённых текущих владельцев.
       if (owner.status !== "VERIFIED") continue;
       if (!telegramOwner.id) continue;
 
@@ -968,7 +1088,6 @@ async function runNftParser(env) {
         now()
       ).run();
 
-      // Если подарок уже есть в базе, повторно не публикуем.
       if (insert.meta.changes !== 1) continue;
 
       await publishNft(gift, owner, env);
@@ -1106,7 +1225,6 @@ async function reserveGift(query, env) {
 
   const currentTime = now();
 
-  // Создаём запись, если пользователь бронирует впервые.
   await env.DB.prepare(`
     INSERT OR IGNORE INTO user_cooldowns (
       telegram_id, last_reserved_at
@@ -1133,7 +1251,6 @@ async function reserveGift(query, env) {
     return;
   }
 
-  // Атомарно захватываем 30-секундный интервал.
   const cooldownUpdate = await env.DB.prepare(`
     UPDATE user_cooldowns
     SET last_reserved_at = ?
@@ -1155,7 +1272,6 @@ async function reserveGift(query, env) {
     return;
   }
 
-  // Атомарно занимаем подарок.
   const giftUpdate = await env.DB.prepare(`
     UPDATE nft_items
     SET status = 'reserved'
@@ -1164,7 +1280,6 @@ async function reserveGift(query, env) {
   `).bind(giftId).run();
 
   if (giftUpdate.meta.changes !== 1) {
-    // Подарок уже забрали — возвращаем cooldown.
     await env.DB.prepare(`
       UPDATE user_cooldowns
       SET last_reserved_at = ?
