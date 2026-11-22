@@ -1,4 +1,3 @@
-
 const GROUP_ID = "-1004393603844";
 
 const TOPICS = {
@@ -19,6 +18,10 @@ const PLANS = {
 const TRIAL_SECONDS = 1800;
 const ORDER_LIFETIME = 1800;
 const RESERVE_COOLDOWN = 30;
+const DAILY_PUBLICATION_LIMIT = 200;
+const DAILY_WINDOW_SECONDS = 24 * 60 * 60;
+const MEDIUM_PRICE_MIN = 1000;
+const EXPENSIVE_PRICE_MIN = 5000;
 
 export default {
   async fetch(request, env) {
@@ -174,6 +177,13 @@ async function ensureParserTables(env) {
       value TEXT
     )
   `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS parser_publications (
+      nft_id TEXT PRIMARY KEY,
+      published_at INTEGER NOT NULL
+    )
+  `).run();
 }
 
 async function saveUser(user, env) {
@@ -285,7 +295,6 @@ async function handleMessage(message, env) {
     );
   }
 }
-
 // ==========================================
 // NFTPARS STATUS
 // ==========================================
@@ -633,7 +642,6 @@ async function createTonOrder(userId, chatId, planName, env) {
     }
   );
 }
-
 // ==========================================
 // TON CENTER API V3
 // ==========================================
@@ -946,7 +954,6 @@ async function expireSubscriptions(env) {
     console.error("EXPIRE SUBSCRIPTIONS ERROR:", error);
   }
 }
-
 // ==========================================
 // NFTPARS API
 // ==========================================
@@ -1031,13 +1038,15 @@ async function runNftParser(env) {
     );
 
     const data = result.data || {};
-    const items = Array.isArray(data.items)
-      ? data.items
-      : Array.isArray(data.gifts)
-        ? data.gifts
-        : Array.isArray(data.results)
-          ? data.results
-          : [];
+    const items = Array.isArray(data)
+      ? data
+      : Array.isArray(data.items)
+        ? data.items
+        : Array.isArray(data.gifts)
+          ? data.gifts
+          : Array.isArray(data.results)
+            ? data.results
+            : [];
 
     let published = 0;
 
@@ -1052,9 +1061,11 @@ async function runNftParser(env) {
       if (!slug) continue;
 
       const collection =
-        gift.collection?.name ||
-        gift.collection?.slug ||
-        "Telegram Gift";
+        typeof gift.collection === "string"
+          ? gift.collection
+          : gift.collection?.name ||
+            gift.collection?.slug ||
+            "Telegram Gift";
 
       const giftName =
         gift.title ||
@@ -1063,6 +1074,20 @@ async function runNftParser(env) {
 
       const username = telegramOwner.username || null;
       const ownerId = Number(telegramOwner.id);
+
+      const priceStars = getGiftPriceStars(gift);
+
+      let category = "new";
+
+      if (priceStars !== null) {
+        if (priceStars >= EXPENSIVE_PRICE_MIN) {
+          category = "expensive";
+        } else if (priceStars >= MEDIUM_PRICE_MIN) {
+          category = "medium";
+        } else {
+          category = "cheap";
+        }
+      }
 
       const insert = await env.DB.prepare(`
         INSERT OR IGNORE INTO nft_items (
@@ -1078,23 +1103,43 @@ async function runNftParser(env) {
           discovered_at,
           status
         )
-        VALUES (?, ?, ?, ?, ?, NULL, NULL, 'new', 'NFTPARS', ?, 'available')
+        VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, 'NFTPARS', ?, 'available')
       `).bind(
         String(slug),
         String(collection),
         String(giftName),
         username,
         ownerId,
+        category,
         now()
       ).run();
 
       if (insert.meta.changes !== 1) continue;
 
-      await publishNft(gift, owner, env);
+      const canPublish = await reserveDailyPublicationSlot(
+        String(slug),
+        env
+      );
+
+      if (!canPublish) {
+        await env.DB.prepare(`
+          DELETE FROM nft_items
+          WHERE id = ? AND status = 'available'
+        `).bind(String(slug)).run();
+
+        console.log("Daily publication limit reached");
+        break;
+      }
+
+      await publishNft(gift, owner, category, priceStars, env);
       published++;
     }
 
-    const nextCursor = data.next_cursor || null;
+    const nextCursor =
+      data.next_cursor ||
+      data.nextCursor ||
+      result.meta?.next_cursor ||
+      null;
 
     await env.DB.prepare(`
       INSERT INTO parser_state (key, value)
@@ -1115,62 +1160,202 @@ async function runNftParser(env) {
 }
 
 // ==========================================
+// PRICE DETECTION
+// ==========================================
+
+// Возвращает цену только если API явно обозначил её в Telegram Stars.
+// Значения в TON/USD и неизвестной валюте не принимаются за звёзды.
+
+function getGiftPriceStars(gift) {
+  const candidates = [
+    gift.price_stars,
+    gift.priceStars,
+    gift.stars_price,
+    gift.telegram_stars_price,
+    gift.attributes?.price_stars,
+    gift.attributes?.priceStars,
+    gift.attributes?.stars_price,
+    gift.attributes?.telegram_stars_price
+  ];
+
+  for (const value of candidates) {
+    if (value === null || value === undefined || value === "") {
+      continue;
+    }
+
+    const number = Number(value);
+
+    if (Number.isFinite(number) && number >= 0) {
+      return number;
+    }
+  }
+
+  const priceObjects = [
+    gift.price,
+    gift.attributes?.price
+  ];
+
+  for (const price of priceObjects) {
+    if (!price || typeof price !== "object") continue;
+
+    const currency = String(
+      price.currency ||
+      price.unit ||
+      price.type ||
+      ""
+    ).toUpperCase();
+
+    if (
+      currency !== "XTR" &&
+      currency !== "STARS" &&
+      currency !== "STAR"
+    ) {
+      continue;
+    }
+
+    const number = Number(
+      price.amount ??
+      price.value ??
+      price.price
+    );
+
+    if (Number.isFinite(number) && number >= 0) {
+      return number;
+    }
+  }
+
+  return null;
+}
+
+// ==========================================
+// DAILY PUBLICATION LIMIT
+// ==========================================
+
+async function reserveDailyPublicationSlot(giftId, env) {
+  const currentTime = now();
+  const windowStart = currentTime - DAILY_WINDOW_SECONDS;
+
+  await env.DB.prepare(`
+    DELETE FROM parser_publications
+    WHERE published_at <= ?
+  `).bind(windowStart).run();
+
+  const existing = await env.DB.prepare(`
+    SELECT nft_id
+    FROM parser_publications
+    WHERE nft_id = ?
+  `).bind(giftId).first();
+
+  if (existing) return false;
+
+  const count = await env.DB.prepare(`
+    SELECT COUNT(*) AS total
+    FROM parser_publications
+    WHERE published_at > ?
+  `).bind(windowStart).first();
+
+  if (Number(count?.total || 0) >= DAILY_PUBLICATION_LIMIT) {
+    return false;
+  }
+
+  try {
+    await env.DB.prepare(`
+      INSERT INTO parser_publications (nft_id, published_at)
+      VALUES (?, ?)
+    `).bind(giftId, currentTime).run();
+
+    return true;
+  } catch (error) {
+    console.error("PUBLICATION SLOT ERROR:", error);
+    return false;
+  }
+}
+// ==========================================
 // PUBLISH NFT
 // ==========================================
 
-async function publishNft(gift, owner, env) {
-  const telegramOwner = owner.telegram || {};
+async function publishNft(gift, owner, env, details = {}) {
+  const telegramOwner = getTelegramOwner(owner || {});
 
-  const slug = gift.slug || gift.id;
-  const collection =
-    gift.collection?.name ||
-    gift.collection?.slug ||
-    "Telegram Gift";
+  const slug = gift.slug || gift.id || gift.ton_nft_address;
+
+  const collection = details.collection ||
+    (typeof gift.collection === "string"
+      ? gift.collection
+      : gift.collection?.name ||
+        gift.collection?.slug ||
+        "Telegram Gift");
 
   const title =
+    details.giftName ||
     gift.title ||
     gift.name ||
-    slug;
+    slug ||
+    "NFT Gift";
 
-  const username = telegramOwner.username
-    ? "@" + telegramOwner.username
-    : "Не указан";
+  const username = details.username || telegramOwner.username;
+  const ownerText = username ? "@" + username : "Не указан";
 
-  const profile = telegramOwner.username
-    ? "https://t.me/" + encodeURIComponent(telegramOwner.username)
+  const profile = username
+    ? "https://t.me/" + encodeURIComponent(username)
     : null;
 
   const giftUrl = gift.telegram_url ||
     (slug ? "https://t.me/nft/" + encodeURIComponent(slug) : null);
 
+  const starsPrice = details.starsPrice ?? extractStarsPrice(gift);
+  const category = details.category || getGiftCategory(starsPrice);
+
+  const categoryLabel = {
+    cheap: "ДЕШЁВЫЙ",
+    medium: "СРЕДНИЙ",
+    expensive: "ДОРОГОЙ",
+    new: "НОВАЯ НАХОДКА"
+  }[category] || "НОВАЯ НАХОДКА";
+
   let text =
-    "💎 <b>НОВАЯ NFT-НАХОДКА</b>\n\n" +
+    "💎 <b>" + categoryLabel + " NFT-НАХОДКА</b>\n\n" +
     "🎁 Подарок: <b>" + escapeHtml(title) + "</b>\n" +
-    "📦 Коллекция: " + escapeHtml(collection) + "\n" +
-    "👤 Владелец: " + escapeHtml(username) + "\n" +
+    "📦 Коллекция: " + escapeHtml(collection) + "\n";
+
+  if (starsPrice !== null) {
+    text +=
+      "⭐ Цена: <b>" +
+      Number(starsPrice).toLocaleString("ru-RU") +
+      " звёзд</b>\n";
+  } else {
+    text += "⭐ Цена: <b>не указана в данных NFTPARS</b>\n";
+  }
+
+  text +=
+    "👤 Владелец: " + escapeHtml(ownerText) + "\n" +
     "🟢 Статус владельца: подтверждён\n" +
     "🔎 Источник: NFTPARS";
 
   if (profile) {
-    text += "\n\n👤 <a href=\"" + escapeHtml(profile) + "\">Открыть профиль</a>";
+    text +=
+      "\n\n👤 <a href=\"" +
+      escapeHtml(profile) +
+      "\">Открыть профиль</a>";
   }
 
   if (giftUrl) {
-    text += "\n🎁 <a href=\"" + escapeHtml(giftUrl) + "\">Открыть подарок</a>";
+    text +=
+      "\n🎁 <a href=\"" +
+      escapeHtml(giftUrl) +
+      "\">Открыть подарок</a>";
   }
 
   const keyboard = {
-    inline_keyboard: [
-      [{
-        text: "🔒 Занять",
-        callback_data: "reserve:" + String(slug)
-      }]
-    ]
+    inline_keyboard: [[{
+      text: "🔒 Занять",
+      callback_data: "reserve:" + String(details.giftId || slug)
+    }]]
   };
 
   await telegram("sendMessage", env, {
     chat_id: getGroupId(env),
-    message_thread_id: TOPICS.new,
+    message_thread_id: getTopicForCategory(category),
     text,
     parse_mode: "HTML",
     disable_web_page_preview: true,
@@ -1307,6 +1492,7 @@ async function reserveGift(query, env) {
       )
       VALUES (?, ?, ?)
     `).bind(giftId, userId, currentTime).run();
+
   } catch (error) {
     await env.DB.prepare(`
       UPDATE nft_items
