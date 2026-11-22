@@ -5,8 +5,8 @@ compatibility_date = "2025-01-01"
 [vars]
 ADMIN_ID = "5151757168"
 WALLET = "UQChRfzub4CLp2FAV998bfowFC4eE3aqIRQQeZinoajQ0oOG"
-GROUP_ID = "-100XXXXXXXXXX"
-THREADS = '{"expensive":2,"cheap":3}'
+GROUP_ID = "-1004393603844"
+THREADS = '{"cheap":3,"expensive":4,"new":5}'
 
 [[d1_databases]]
 binding = "DB"
